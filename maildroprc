@@ -1,0 +1,83 @@
+# Global maildrop filter file
+
+ROOTDIR="/home/vmail"
+MAILDIR="$ROOTDIR/$4/$3"
+DELIVERYDIR="$MAILDIR"
+SHELL="/bin/bash"
+SCRIPT_DIR="/usr/share/spam_tracker3"
+
+EXTENSION="$1"
+RECIPIENT="$2"
+USER="$3"
+HOST="$4"
+MAIL="$USER@$HOST"
+SENDER="$5"
+logfile "/var/log/vmail/$MAIL"
+
+`test -d $ROOTDIR/$HOST`
+if ( $RETURNCODE == 1 )
+{
+	exception {
+		log "Create virtual domain dir $ROOTDIR/$HOST"
+		`/bin/mkdir "$ROOTDIR/$HOST"`
+	}
+}
+
+`test -d $MAILDIR`
+if ( $RETURNCODE == 1 )
+{
+	exception {
+		log "Create virtual user dir $DEFAULT"
+		`/usr/bin/maildirmake.maildrop $DEFAULT`
+	}
+}
+
+if ( "$EXTENSION" ne "" )
+{
+    DELIMITER="+"
+    log "EXTENSION = $EXTENSION"
+}
+
+
+if (!$SENDER)
+{
+    SENDER = "<>"
+}
+
+FOLDER=`/usr/bin/python $SCRIPT_DIR/get_dir.py $SENDER $MAIL`
+if(!$FOLDER)
+{
+	if(/^X-Virus-Status:.*Yes/)
+	{
+		FOLDER=`/usr/bin/python $SCRIPT_DIR/get_dir.py [VIRUS] $MAIL`
+	}
+	if ( (/^X-Spam-Flag: YES/:h) || (/^X-Spam-Status: Yes/:h) )
+	{
+		FOLDER=`/usr/bin/python $SCRIPT_DIR/get_dir.py [SPAM] $MAIL`
+	}
+}
+
+exception {
+	include "$ROOTDIR/$HOST/mailfilter"
+}
+
+exception {
+	include "$MAILDIR/mailfilter"
+}
+
+if($FOLDER)
+{
+	DELIVERYDIR="$MAILDIR/.$FOLDER"
+	`test -d $DELIVERYDIR`
+	if ( $RETURNCODE == 1 )
+	{
+		exception {
+			log "Create folder $DELIVERYDIR"
+			`/usr/bin/maildirmake.maildrop -f $FOLDER $MAILDIR`
+		}
+	}
+}
+
+log "Deliverydir: $DELIVERYDIR"
+to "$DELIVERYDIR";
+

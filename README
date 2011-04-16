@@ -1,0 +1,8 @@
+Install:
+
+- Create database structure.
+- Add the following line in /etc/postfix/master.cf
+wcenter-deliver   unix  -       n       n       -       -       pipe
+    flags=ODRhu user=vmail argv=/usr/share/wmail/deliver.py -f ${sender} -d ${recipient} -e ${extension}
+- Copy maildroprc to /etc/maildroprc
+- Reload postfix. /etc/init.d/postfix reload

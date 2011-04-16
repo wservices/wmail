@@ -1,0 +1,10 @@
+class WConfig:
+    TITLE           =   "wservices.ch"
+
+    WCENTER_DIR     =   "/root/wcenter_project"
+    MYSQL_HOST      =   "127.0.0.1"
+    MYSQL_PORT      =   3306
+    MYSQL_USER      =   ""
+    MYSQL_PASSWD    =   ""
+    MYSQL_DB        =   ""
+    LOGFILE         =   "/var/log/vmail/vmail.log"
