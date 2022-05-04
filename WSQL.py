@@ -1,6 +1,6 @@
 import MySQLdb
 
-from WConfig import *
+from WConfig import WConfig
 
 class WSQL:
 	def __init__(self):
