@@ -1,27 +1,28 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
+import argparse
 from decimal import Decimal
-import sys
-import os
-import traceback
-import subprocess
 import email
+import functools
+import logging
+import MySQLdb
 import operator
+import os
+import sys
+import subprocess
+import traceback
 
-from WConfig import WConfig
-
-import WLog # seperat WLog for spam_tracker
-import WSQL
+import WConfig
 
 
 # Paths to binaries
 CLAMSCAN = '/usr/bin/clamdscan'
 SPAMC = '/usr/bin/spamc'
-REFORMAIL = '/usr/bin/reformail'
 DOVECOT_DELIVER = '/usr/lib/dovecot/deliver'
 POSTFIX_DELIVER = '/usr/lib/postfix/virtual'
-DELIMITER = '+'
 MAILER_DAEMON = '<mailer@wservices.ch>'
+
+LOG_FILE = '/var/log/vmail/vmail.log'
 
 
 # Files which are bigger than this size (in bytes) will not be checked for spam.
@@ -30,6 +31,14 @@ MAX_SPAM_SIZE=1000000
 # The following headers will be removed from the mail body before applying the new headers.
 RESERVED_HEADERS = ['X-Virus-Checker-Version', 'X-Virus-Status', 'X-Virus-Report', 
                     'X-Spam-Checker-Version', 'X-Spam-Level', 'X-Spam-Status', 'X-Spam-Report', 'X-Spam-Flag']
+
+
+log = logging.getLogger('wcenter-lda')
+log.setLevel(logging.DEBUG)
+# create file handler which logs even debug messages
+fh = logging.FileHandler(LOG_FILE)
+fh.setLevel(logging.DEBUG)
+log.addHandler(fh)
 
 
 def setuid(uid, gid, environ=None):
@@ -45,186 +54,174 @@ def setuid(uid, gid, environ=None):
 def print_error(e):
     try:
         #sys.stderr.write('Exception: %s' % e)
-        if WLog.log_file:
-            WLog.error('Exception: %s' % e)
-            traceback.print_exc(file=WLog.log_file)
-            WLog.close()
+        log.error('Exception: %s' % e)
+        traceback.print_exc(file=LOG_FILE)
     except:
         # File silently, as we can't log or print the error
         pass
 
 
 class Mail():
-    def __init__(self, data):
+    def __init__(self, data, mail_from, mail_to, extension):
         self.data = data
+        self.mail_from = mail_from
+        self.mail_to = mail_to
+        self.extension = extension
+
         self.is_virus = None
         self.is_spam = None
-        self.required_spam_score = 5.0
+        self.required_spam_score = Decimal(5.0)
 
-        self.uid = 200
-        self.gid = 200
+        self.spam_dir = 'Junk'
+        self.virus_dir = 'Junk'
+        self.uid = None
+        self.gid = None
 
         if not self.data:
             return
-
-        self.sql = WSQL.WSQL()
 
         # get account
         self.parse()
 
     def parse(self):
-        # Split the data into headers and body
-        split = data.find('\n\n')
-        self.header_data = '%s\n\n' % data[:split]
-        self.body_data = data[split+2:]
-
         # parse the e-mail header
-        WLog.debug('Parsing e-mail')
-        message = email.message_from_string(self.header_data)
-        try:
-            self.mail_to = sys.argv[sys.argv.index('-d')+1]
-        except (IndexError, ValueError):
-            WLog.error('no recipient found')
-            sys.stderr.write('no recipient found')
-            sys.exit(2)
-        try:
-            self.mail_from = sys.argv[sys.argv.index('-f')+1]
-        except (IndexError, ValueError):
-            self.mail_from = 'unknown'
-        if not self.mail_from:
-            self.mail_from = message.get('From')
+        log.debug('Parsing e-mail')
+        self.message = email.message_from_string(self.data.decode())
+
         if not self.mail_to:
             self.mail_to = message.get('Delivered-To')
-        WLog.debug('e-mail from %s to %s' % (self.mail_from, self.mail_to))
+            if not self.mail_to:
+                log.error('no recipient found')
+                sys.stderr.write('no recipient found')
+                sys.exit(2)
+
+        self.mail_from = self.message.get('From')
+        if not self.mail_from:
+            self.mail_from = 'unknown'
+
+        log.debug('e-mail from %s to %s' % (self.mail_from, self.mail_to))
 
         try:
             (self.user, self.domain) = self.mail_to.split('@')
         except:
-            WLog.error('no valid destination mail address %s' % self.mail_to)
+            log.error('no valid destination mail address %s' % self.mail_to)
             sys.stderr.write('no valid destination mail address %s' % self.mail_to)
             sys.exit(3)
-
-        try:
-            self.extensions = sys.argv[sys.argv.index('-e')+1]
-        except (IndexError, ValueError):
-            self.extensions = ''
 
         # set dovecot as default deliver
         self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-f', self.mail_from]
 
         # replace Return-Path: <MAILER-DAEMON>
-        try:
-            if message.get('Return-Path') == '<MAILER-DAEMON>':
-                WLog.notice('replace Return-Path: <MAILER-DAEMON> to %s' % MAILER_DAEMON)
-                status, result = run([REFORMAIL, '-I', 'Return-Path:%s' % MAILER_DAEMON], self.header_data)
-                if status == 0:
-                    self.header_data = result
-        except Exception, e:
-            WLog.error('%s' % e)
+        if self.message.get('Return-Path') == '<MAILER-DAEMON>':
+            log.info('replace Return-Path: <MAILER-DAEMON> to %s' % MAILER_DAEMON)
+            del self.message['Return-Path']
+            self.message['Return-Path'] = MAILER_DAEMON
 
     def check(self):
+        check_virus_bool = True
+        check_spam_bool = True
+
         # get account settings
         try:
-            result = self.sql.execute('SELECT check_virus, virus_dir, check_spam, spam_dir, required_spam_score, uid, gid FROM mail_users WHERE email=%s', (self.mail_to.lower(),), True)
-            check_virus_bool = result[0][0]
-            self.virus_dir = result[0][1]
-            check_spam_bool = result[0][2]
-            self.spam_dir = result[0][3]
-            self.required_spam_score = Decimal(result[0][4])
-            self.uid = int(result[0][5])
-            self.gid = int(result[0][6])
-        except Exception, e: # any errors
-            WLog.warning('Can not fetch spam settings %s' % e)
-            check_virus_bool = True
-            self.virus_dir = 'Junk'
-            check_spam_bool = True
-            self.spam_dir = 'Junk'
-            self.required_spam_score = 5.0
+            conn = MySQLdb.connect(host=WConfig.MYSQL_HOST, port=WConfig.MYSQL_PORT, user=WConfig.MYSQL_USER, passwd=WConfig.MYSQL_PASSWD, db=WConfig.MYSQL_DB)
+            cursor = conn.cursor()
+            cursor.execute('SELECT check_virus, virus_dir, check_spam, spam_dir, required_spam_score, uid, gid FROM mail_users WHERE email LIKE %s', (self.mail_to.lower(),))
+            result = cursor.fetchone()
+            if result:
+                check_virus_bool = result[0]
+                self.virus_dir = result[1]
+                check_spam_bool = result[2]
+                self.spam_dir = result[3]
+                self.required_spam_score = Decimal(result[4])
+                #self.uid = int(result[5])
+                #self.gid = int(result[6])
+        except Exception as e: # any errors
+            log.warning('Can not fetch spam settings %s' % e)
 
-        """
-        try:
-            setuid(self.uid, self.gid)
-        except OSError, e:
-            WLog.warning('Can not set uid/gid %s' % e)
-            pass
-        """
+        if self.uid and self.gid:
+            try:
+                setuid(self.uid, self.gid)
+            except OSError as e:
+                log.warning('Can not set uid/gid %s' % e)
+                pass
 
+        virus_headers = {}
         if check_virus_bool:
             # Check for viruses
             self.is_virus, virus_headers = self.check_virus()
-        else:
-            virus_headers = []
 
-        # Only check for spam if there's no virus, check_spam_bool=True and if the mail is smaller than MAX_SPAM_SIZE
-        if not self.is_virus and len(data) <= MAX_SPAM_SIZE and check_spam_bool:
+        spam_headers = {}
+        if not self.is_virus and check_spam_bool and len(self.data) <= MAX_SPAM_SIZE:
+            # Only check for spam if there's no virus, check_spam_bool=True and if the mail is smaller than MAX_SPAM_SIZE
             self.is_spam, spam_headers = self.check_spam()
-        else:
-            spam_headers = []
 
         if self.is_virus:
             self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-f', self.mail_from, '-m', self.virus_dir]
         elif self.is_spam:
             self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-f', self.mail_from, '-m', self.spam_dir]
-        elif self.extensions:
-            self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-f', self.mail_from, '-m', self.extensions]
+        elif self.extension:
+            self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-f', self.mail_from, '-m', self.extension]
 
-        headers = virus_headers + spam_headers
+        headers = {**virus_headers, **spam_headers}
 
-        if headers:
-            args = reduce(operator.add, [['-I', header] for header in ['%s:'%h for h in RESERVED_HEADERS]+headers])
-            status, result = run([REFORMAIL]+args, self.header_data)
-            assert status == 0, 'Could not run %s (exit code %d)' % (REFORMAIL, status)
-            self.data = result+self.body_data
-            WLog.debug('New headers set')
+        for header_name in RESERVED_HEADERS:
+            del self.message[header_name]
+        for header_name,header_value in headers.items():
+            self.message[header_name] = header_value
 
     def check_virus(self):
-        headers = []
+        headers = {}
 
         # Get the version
         status, version = run([CLAMSCAN, '-V'])
         assert status == 0, 'Could not run %s (exit code %d)' % (CLAMSCAN, status)
 
-        headers.append('X-Virus-Checker-Version: %s' % version.split('\n')[0])
+        headers['X-Virus-Checker-Version'] = version.split(b'\n')[0].decode()
 
         # Scan the message
-        status, message = run([CLAMSCAN, '-', '--stdout'], self.data)
+        status, report = run([CLAMSCAN, '-', '--stdout'], self.data)
         
         if status == 0:
             # No virus
-            headers.append('X-Virus-Status: No')
+            headers['X-Virus-Status'] = 'No'
         elif status == 1:
             # Virus found
-            headers.append('X-Virus-Status: Yes')
+            headers['X-Virus-Status'] = 'Yes'
             try:
                 # Note: There may be multiple status lines. Do we want to parse them?
-                headers.append('X-Virus-Report: %s' % message.split()[1])
+                headers['X-Virus-Report'] = report.split()[1].decode()
             except IndexError:
-                headers.append('X-Virus-Report: Failed')
+                headers['X-Virus-Report'] = 'Failed'
         else:
-            # Failed
-            headers.append('X-Virus-Status: Failed')
+            headers['X-Virus-Status'] = 'Failed'
+
+        try:
+            status = int(status)
+        except ValueError:
+            pass
 
         return (status == 1, headers)
 
     def check_spam(self):
-        headers = []
+        headers = {}
 
-        # Scan the message
-        #status, result = run([SPAMC, '-R', '-u', 'vmail'], self.data)
-        # If spam returncode is 1, else returncode is 0
-        #assert status == 0 or status == 1, 'Could not run %s (exit code %d)' % (SPAMC, status)
         p = subprocess.Popen([SPAMC, '-R', '-u', 'vmail', '-s', str(MAX_SPAM_SIZE)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        (result, stderrdata) = p.communicate(self.data)
-        if stderrdata:
-            log.error('Spamc error: %s' % stderrdata)
+        stdout, stderr = p.communicate(self.data)
+        if stderr:
+            log.error('Spamc stderr: %s' % stderr)
+
+        # If spam returncode is 1, else returncode is 0
         if p.returncode and p.returncode != 1:
             log.error('Spamc error: returncode: %s' % p.returncode)
+            return (False, {})
+
+        result = stdout.decode()
 
         # No try/except here, as there shouldn't be any errors
         try:
             ignore, version, score, tests, summary = result.split('\n', 4)
         except ValueError:
-            WLog.error('Result unknown spamc format, result: %s' % result)
+            log.error('Result unknown spamc format, result: %s' % result)
             version = 'error'
             score = '3'
             summary = 'Error during spam check'
@@ -235,35 +232,32 @@ class Mail():
             spam_score = score
             spam_level = ''
 
-        spam_score_float = Decimal(str(spam_score))
+        spam_score_float = Decimal(spam_score)
         is_spam = spam_score_float >= self.required_spam_score
 
         # Set the headers
-        headers.append('X-Spam-Checker-Version: %s' % version)
+        headers['X-Spam-Checker-Version'] = version
         if spam_level:
-            headers.append('X-Spam-Level: %s' % spam_level)
-        headers.append('X-Spam-Status: %s, score=%s required=%s %s' % \
-                (is_spam and 'Yes' or 'No', spam_score, self.required_spam_score, tests))
+            headers['X-Spam-Level'] = spam_level
+        headers['X-Spam-Status'] = '%s, score=%s required=%s %s' % \
+                (is_spam and 'Yes' or 'No', spam_score, self.required_spam_score, tests)
         if is_spam:
-            headers.append('X-Spam-Flag: YES')
-            headers.append('X-Spam-Report: ---- Start SpamAssassin results\n\t* %s\n\t---- End of SpamAssassin results' % \
+            headers['X-Spam-Flag'] = 'YES'
+            headers['X-Spam-Report'] = '---- Start SpamAssassin results\n\t* %s\n\t---- End of SpamAssassin results' % \
                     summary.replace('\n', '\n\t').strip().replace('\t', '\t* ')
-                )
 
         return (is_spam, headers)
 
     def deliver(self):
-        WLog.debug('User %s Group %s' % (os.getuid(), os.getgid()))
-        WLog.debug('Deliver with: %s' % self.deliver_application)
+        log.debug('User %s Group %s' % (os.getuid(), os.getgid()))
+        log.debug('Deliver with: %s' % self.deliver_application)
         p = subprocess.Popen(self.deliver_application, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        (stdoutdata, stderrdata) = p.communicate(self.data)
+        stdout, stderr = p.communicate(self.message.as_bytes())
         if p.returncode:
-            WLog.error('Delivery error: %s %s %s' % (p.returncode, stderrdata,stdoutdata))
+            log.error('Delivery error: %s %s %s' % (p.returncode, stderr, stdout))
             sys.exit(p.returncode)
-        WLog.debug('Delivered')
-        #p = subprocess.Popen(self.deliver_application, stdin=subprocess.PIPE)
-        #p.stdin.write(self.data)
-        #p.stdin.close()
+        else:
+            log.debug('Delivered')
 
 
 def run(cmd, data=None):
@@ -290,24 +284,25 @@ def dummy_deliver(data):
     sys.exit(1)
 
 if __name__ == '__main__':
-    try:
-        WLog.open_log(WConfig.LOGFILE)
-    except Exception, e:
-        pass
-    
-    data = sys.stdin.read()
+    parser = argparse.ArgumentParser(description='wcenter local delivery agent')
+    parser.add_argument('mail_from', nargs='?', help='MAIL FROM (Mail received from)', default='unkown')
+    parser.add_argument('mail_to', nargs='?', help='RCPT TO (Recipient email address)')
+    parser.add_argument('extension', nargs='?', help='Mail extension', default='')
+    args = parser.parse_args()
+
+    data = sys.stdin.buffer.read()
 
     try:
-        mail = Mail(data) # parse mail
-    except Exception, e:
+        mail = Mail(data, args.mail_from, args.mail_to, args.extension) # parse mail
+    except Exception as e:
         print_error(e)
         sys.exit(1)
     try:
         mail.check()      # check mail for spam and viruses
-    except Exception, e:
+    except Exception as e:
         print_error(e)
     try:
         mail.deliver()    # deliver the mail
-    except Exception, e:
+    except Exception as e:
         print_error(e)
 
