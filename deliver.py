@@ -32,10 +32,8 @@ MAX_SPAM_SIZE=1000000
 RESERVED_HEADERS = ['X-Virus-Checker-Version', 'X-Virus-Status', 'X-Virus-Report', 
                     'X-Spam-Checker-Version', 'X-Spam-Level', 'X-Spam-Status', 'X-Spam-Report', 'X-Spam-Flag']
 
-
 log = logging.getLogger('wcenter-lda')
 log.setLevel(logging.DEBUG)
-# create file handler which logs even debug messages
 fh = logging.FileHandler(LOG_FILE)
 fh.setLevel(logging.DEBUG)
 log.addHandler(fh)
@@ -53,20 +51,21 @@ def setuid(uid, gid, environ=None):
 
 def print_error(e):
     try:
-        #sys.stderr.write('Exception: %s' % e)
         log.error('Exception: %s' % e)
-        traceback.print_exc(file=LOG_FILE)
+        traceback.print_exc(file=open(LOG_FILE, 'a'))
+        sys.stderr.write(str(e))
     except:
         # File silently, as we can't log or print the error
         pass
 
 
 class Mail():
-    def __init__(self, data, mail_from, mail_to, extension):
+    def __init__(self, data, mail_from, mail_to, extension, queue_id):
         self.data = data
         self.mail_from = mail_from
         self.mail_to = mail_to
         self.extension = extension
+        self.queue_id = queue_id
 
         self.is_virus = None
         self.is_spam = None
@@ -78,22 +77,21 @@ class Mail():
         self.gid = None
 
         if not self.data:
-            return
+            raise ValueError('Message is empty')
 
         # get account
         self.parse()
 
     def parse(self):
-        # parse the e-mail header
         log.debug('Parsing e-mail')
-        self.message = email.message_from_string(self.data.decode())
+        self.message = email.message_from_bytes(self.data)
 
         if not self.mail_to:
             self.mail_to = message.get('Delivered-To')
             if not self.mail_to:
                 log.error('no recipient found')
                 sys.stderr.write('no recipient found')
-                sys.exit(2)
+                sys.exit(75)
 
         self.mail_from = self.message.get('From')
         if not self.mail_from:
@@ -103,13 +101,13 @@ class Mail():
 
         try:
             (self.user, self.domain) = self.mail_to.split('@')
-        except:
+        except ValueError:
             log.error('no valid destination mail address %s' % self.mail_to)
             sys.stderr.write('no valid destination mail address %s' % self.mail_to)
-            sys.exit(3)
+            sys.exit(75)
 
         # set dovecot as default deliver
-        self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-f', self.mail_from]
+        self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to]
 
         # replace Return-Path: <MAILER-DAEMON>
         if self.message.get('Return-Path') == '<MAILER-DAEMON>':
@@ -156,11 +154,11 @@ class Mail():
             self.is_spam, spam_headers = self.check_spam()
 
         if self.is_virus:
-            self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-f', self.mail_from, '-m', self.virus_dir]
+            self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-m', self.virus_dir]
         elif self.is_spam:
-            self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-f', self.mail_from, '-m', self.spam_dir]
+            self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-m', self.spam_dir]
         elif self.extension:
-            self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-f', self.mail_from, '-m', self.extension]
+            self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-m', self.extension]
 
         headers = {**virus_headers, **spam_headers}
 
@@ -180,24 +178,28 @@ class Mail():
 
         # Scan the message
         status, report = run([CLAMSCAN, '-', '--stdout'], self.data)
-        
+
         if status == 0:
             # No virus
             headers['X-Virus-Status'] = 'No'
         elif status == 1:
             # Virus found
             headers['X-Virus-Status'] = 'Yes'
+
             try:
                 # Note: There may be multiple status lines. Do we want to parse them?
                 headers['X-Virus-Report'] = report.split()[1].decode()
-            except IndexError:
+            except IndexError as e:
+                log.warning('Set X-Virus-Report failed: {}'.format(e))
                 headers['X-Virus-Report'] = 'Failed'
         else:
             headers['X-Virus-Status'] = 'Failed'
+        log.debug('Virus status: {} ({})'.format(headers.get('X-Virus-Status'), status))
 
         try:
             status = int(status)
         except ValueError:
+            log.warning('Virus status is not an integer: {}'.format(status))
             pass
 
         return (status == 1, headers)
@@ -221,19 +223,19 @@ class Mail():
         try:
             ignore, version, score, tests, summary = result.split('\n', 4)
         except ValueError:
-            log.error('Result unknown spamc format, result: %s' % result)
+            log.error('Unknown spamc format: {}'.format(result))
             version = 'error'
-            score = '3'
+            score = '3 ***'
             summary = 'Error during spam check'
             tests = ''
         try:
             spam_score, spam_level = score.split(' ')
         except ValueError:
+            log.warning('Unknown spamc score format: {}'.format(score))
             spam_score = score
             spam_level = ''
 
-        spam_score_float = Decimal(spam_score)
-        is_spam = spam_score_float >= self.required_spam_score
+        is_spam = Decimal(spam_score) >= self.required_spam_score
 
         # Set the headers
         headers['X-Spam-Checker-Version'] = version
@@ -245,14 +247,17 @@ class Mail():
             headers['X-Spam-Flag'] = 'YES'
             headers['X-Spam-Report'] = '---- Start SpamAssassin results\n\t* %s\n\t---- End of SpamAssassin results' % \
                     summary.replace('\n', '\n\t').strip().replace('\t', '\t* ')
+        log.debug('Spam status: {}'.format(headers.get('X-Spam-Status')))
 
         return (is_spam, headers)
 
     def deliver(self):
-        log.debug('User %s Group %s' % (os.getuid(), os.getgid()))
+        #log.debug('User %s Group %s' % (os.getuid(), os.getgid()))
         log.debug('Deliver with: %s' % self.deliver_application)
+        message = self.message.as_bytes()
+
         p = subprocess.Popen(self.deliver_application, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = p.communicate(self.message.as_bytes())
+        stdout, stderr = p.communicate(message)
         if p.returncode:
             log.error('Delivery error: %s %s %s' % (p.returncode, stderr, stdout))
             sys.exit(p.returncode)
@@ -269,40 +274,46 @@ def run(cmd, data=None):
         proc.stdin.close()
         result = proc.stdout.read()
         proc.stdout.close()
-    except IOError: # The child closed the file too early. Don't return anything in that case.
+    except IOError as e: # The child closed the file too early. Don't return anything in that case.
+        log.error('{}: {}'.format(cmd, e))
         result = ''
 
     status = os.waitpid(proc.pid, 0)[1]/256
 
     return (status, result)
 
-def dummy_deliver(data):
-    p = subprocess.Popen([DUMMY_DELIVER], stdin=subprocess.PIPE)
-    p.stdin.write(data)
-    p.stdin.close()
-
-    sys.exit(1)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='wcenter local delivery agent')
     parser.add_argument('mail_from', nargs='?', help='MAIL FROM (Mail received from)', default='unkown')
     parser.add_argument('mail_to', nargs='?', help='RCPT TO (Recipient email address)')
     parser.add_argument('extension', nargs='?', help='Mail extension', default='')
+    parser.add_argument('queue_id', nargs='?', help='Postfix queue ID', default='')
     args = parser.parse_args()
 
     data = sys.stdin.buffer.read()
 
+    formatter = logging.Formatter(
+        fmt='%(asctime)s %(name)s[%(process)d] {} %(levelname)s: %(message)s'.format(args.queue_id),
+        #datefmt='%Y-%m-%d %H:%M:%S',
+    )
+    fh.setFormatter(formatter)
+
     try:
-        mail = Mail(data, args.mail_from, args.mail_to, args.extension) # parse mail
+        mail = Mail(data, args.mail_from, args.mail_to, args.extension, args.queue_id) # parse mail
     except Exception as e:
+        log.error('parsing error')
         print_error(e)
-        sys.exit(1)
+        sys.exit(75)    # EX_TEMPFAIL: A temporary failure.
     try:
-        mail.check()      # check mail for spam and viruses
+        mail.check()    # check mail for spam and viruses
     except Exception as e:
+        log.error('mail check error')
         print_error(e)
     try:
-        mail.deliver()    # deliver the mail
+        mail.deliver()  # deliver the mail
     except Exception as e:
+        log.error('mail delivery error')
         print_error(e)
+        sys.exit(75)    # EX_TEMPFAIL: A temporary failure.
 
