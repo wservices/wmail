@@ -87,10 +87,10 @@ class Mail():
         self.message = email.message_from_bytes(self.data)
 
         if not self.mail_to:
-            self.mail_to = message.get('Delivered-To')
+            self.mail_to = self.message.get('Delivered-To')
             if not self.mail_to:
                 log.error('no recipient found')
-                sys.stderr.write('no recipient found')
+                sys.stderr.write('no recipient found\n')
                 sys.exit(75)
 
         self.mail_from = self.message.get('From')
@@ -103,7 +103,7 @@ class Mail():
             (self.user, self.domain) = self.mail_to.split('@')
         except ValueError:
             log.error('no valid destination mail address %s' % self.mail_to)
-            sys.stderr.write('no valid destination mail address %s' % self.mail_to)
+            sys.stderr.write('no valid destination mail address %s\n' % self.mail_to)
             sys.exit(75)
 
         # set dovecot as default deliver
@@ -133,6 +133,8 @@ class Mail():
                 self.required_spam_score = Decimal(result[4])
                 #self.uid = int(result[5])
                 #self.gid = int(result[6])
+            cursor.close()
+            conn.close()
         except Exception as e: # any errors
             log.warning('Can not fetch spam settings %s' % e)
 
