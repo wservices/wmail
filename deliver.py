@@ -8,6 +8,7 @@ import logging
 import MySQLdb
 import operator
 import os
+import re
 import sys
 import subprocess
 import traceback
@@ -18,6 +19,9 @@ import WConfig
 # Paths to binaries
 CLAMSCAN = '/usr/bin/clamdscan'
 SPAMC = '/usr/bin/spamc'
+RSPAMC = '/usr/bin/rspamc'
+RSPAMC_SCORE_REGEX = re.compile('^Score:\s+([\d.-]+) ?/ ?([\d.-])+')
+RSPAMC_IS_SPAM_REGEX = re.compile('^Spam:\s+(true|false)+')
 DOVECOT_DELIVER = '/usr/lib/dovecot/deliver'
 POSTFIX_DELIVER = '/usr/lib/postfix/virtual'
 MAILER_DAEMON = '<mailer@wservices.ch>'
@@ -30,7 +34,8 @@ MAX_SPAM_SIZE=1000000
 
 # The following headers will be removed from the mail body before applying the new headers.
 RESERVED_HEADERS = ['X-Virus-Checker-Version', 'X-Virus-Status', 'X-Virus-Report', 
-                    'X-Spam-Checker-Version', 'X-Spam-Level', 'X-Spam-Status', 'X-Spam-Report', 'X-Spam-Flag']
+                    'X-Spam-Checker-Version', 'X-Spam-Level', 'X-Spam-Status', 'X-Spam-Report', 'X-Spam-Flag',
+                    'X-Rspam-Status', 'X-Rspam-Flag']
 
 log = logging.getLogger('wcenter-lda')
 log.setLevel(logging.DEBUG)
@@ -69,6 +74,7 @@ class Mail():
 
         self.is_virus = None
         self.is_spam = None
+        self.is_rspam = None
         self.required_spam_score = Decimal(5.0)
 
         self.spam_dir = 'Junk'
@@ -151,18 +157,22 @@ class Mail():
             self.is_virus, virus_headers = self.check_virus()
 
         spam_headers = {}
+        rspam_headers = {}
         if not self.is_virus and check_spam_bool and len(self.data) <= MAX_SPAM_SIZE:
             # Only check for spam if there's no virus, check_spam_bool=True and if the mail is smaller than MAX_SPAM_SIZE
-            self.is_spam, spam_headers = self.check_spam()
+            log.debug('X-SMTP-Auth: {}'.format(self.message.get('X-SMTP-Auth')))
+            if self.message.get('X-SMTP-Auth') == 'no':
+                #self.is_spam, spam_headers = self.check_spam()
+                self.is_rspam, rspam_headers = self.check_rspam()
 
         if self.is_virus:
             self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-m', self.virus_dir]
-        elif self.is_spam:
+        elif self.is_spam or self.is_rspam:
             self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-m', self.spam_dir]
         elif self.extension:
             self.deliver_application = [DOVECOT_DELIVER, '-d', self.mail_to, '-m', self.extension]
 
-        headers = {**virus_headers, **spam_headers}
+        headers = {**virus_headers, **spam_headers, **rspam_headers}
 
         for header_name in RESERVED_HEADERS:
             del self.message[header_name]
@@ -206,6 +216,46 @@ class Mail():
 
         return (status == 1, headers)
 
+    def check_rspam(self):
+        headers = {}
+
+        p = subprocess.Popen([RSPAMC], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = p.communicate(self.data)
+        if stderr:
+            log.error('rspamc stderr: %s' % stderr)
+            return (False, {})
+
+        # If spam returncode is 1, else returncode is 0
+        if p.returncode and p.returncode != 1:
+            log.error('rspamc error: returncode: %s' % p.returncode)
+            return (False, {})
+
+        spam_score = None
+        required_spam_score = None
+        is_rspam = False
+        result = stdout.decode()
+        for line in result.split('\n'):
+            is_rspam_match = RSPAMC_IS_SPAM_REGEX.match(line)
+            if is_rspam_match:
+                is_rspam = is_rspam_match[1] == 'true'
+            score_match = RSPAMC_SCORE_REGEX.match(line)
+            if score_match:
+                spam_score = score_match[1]
+                required_spam_score = score_match[2]
+            ham_match = re.match('^Symbol:\s+(\S+)\s+(.*)$', line)
+            if ham_match:
+                if ham_match[1] in ['BAYES_HAM', 'BAYES_SPAM']:
+                    log.debug('Symbol: {} {}'.format(ham_match[1], ham_match[2]))
+
+        if spam_score != None:
+            headers['X-Rspam-Status'] = '%s, score=%s' % (is_rspam and 'Yes' or 'No', spam_score)
+        if is_rspam:
+            headers['X-Rspam-Flag'] = 'YES'
+
+        log.debug('Rspam status: {}'.format(headers.get('X-Rspam-Status')))
+        log.debug('Rspam flag: {}'.format(headers.get('X-Rspam-Flag')))
+        return (is_rspam, headers)
+
     def check_spam(self):
         headers = {}
 
@@ -213,6 +263,7 @@ class Mail():
         stdout, stderr = p.communicate(self.data)
         if stderr:
             log.error('Spamc stderr: %s' % stderr)
+            return (False, {})
 
         # If spam returncode is 1, else returncode is 0
         if p.returncode and p.returncode != 1:
